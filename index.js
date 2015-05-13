@@ -4,7 +4,9 @@ var events = require('events');
 var stream = require('stream');
 var async = require('async');
 var mkdirp = require('mkdirp');
+var bunyan = require('bunyan');
 var Ftp = require('ftp');
+var pkg = require('./package.json');
 
 
 var defaults = {
@@ -30,153 +32,147 @@ module.exports = function (options) {
     return memo;
   }, {});
 
+  var log = bunyan.createLogger({ name: pkg.name, level: 'debug' });
+
   var clients = [];
 
-  function getClient(ee, cb) {
+  function getClient(cb) {
     var client = clients.filter(function (client) {
       return client._ready;
     }).shift();
 
     if (client) {
-      ee.emit('data', 'Reusing client...');
+      client.log.info('Reusing client...');
       return cb(null, client);
     }
 
-    ee.emit('data', 'instantiating new client...');
-    clients[clients.length] = client = new Ftp();
+    var clientId = clients.length;
+    clients[clientId] = client = new Ftp();
+
+    client.log = log.child({ client: clientId });
+    client.log.debug('Instantiating new client...');
 
     client.on('error', cb);
 
     client.on('greeting', function (msg) {
-      ee.emit('data', 'greeting: ' + msg);
-    });
-
-    client.on('close', function (hadError) {
-      console.log('close', hadError);
-    });
-
-    client.on('end', function () {
-      console.log('end');
+      client.log.debug('Greeting: ' + msg);
     });
 
     client.on('ready', function () {
+      client.log.debug('Client is ready');
       cb(null, client);
+    });
+
+    client.on('end', function () {
+      client.log.debug('Client ended');
+    });
+
+    client.on('close', function (hadError) {
+      client.log.debug('Client has closed', hadError);
     });
 
     client.connect(settings);
   }
 
   var q = async.queue(function (task, cb) {
-    var ee = task.ee;
+    var log = task.log;
     var command = task.command;
     var args = task.args;
 
-    getClient(ee, function (err, client) {
-      var resp;
-      var fn = client[task.command];
-    
-      fn.apply(client, args.concat(function (err, data) {
-        if (err) { return cb(err); }
-
-        if (data instanceof stream.Readable) {
-          data.on('close', function () {
-            console.log('CLOSE', arguments);
-          });
-        } else {
-          ee.emit('data', data);
-          cb();
-        }
-      }));
+    getClient(function (err, client) {
+      if (err) { return cb(err); }
+      var fn = client[command];
+      log.debug('Sending request...', { command: command, args: args });
+      fn.apply(client, args.concat(cb));
     });
-
   }, settings.maxConcurrency);
 
   q.drain = function () {
-    console.log('drain');
+    log.debug('No requests left in queue');
     clients.forEach(function (client) {
-      client.end();
+      if (!client._curReq) {
+        client.end();
+      }
     });
   };
 
+  var requests = 0;
+
   function queueRequest() {
-    var ee = new events.EventEmitter();
     var args = Array.prototype.slice.call(arguments, 0)
+    var cb = args.pop();
     var command = args.shift();
+    var reqId = requests++;
+    var childLog = log.child({ request: reqId });
 
     process.nextTick(function () {
-      ee.emit('data', 'Queuing command ' + command + '...');
+      childLog.debug('Queuing command...', { command: command, args: args });
       q.push({
         command: command,
         args: args,
-        ee: ee
-      });
+        log: childLog
+      }, cb);
     });
-
-    return ee;
   }
 
 
   var fsync = {};
 
 
-  fsync.status = function () {
-    return queueRequest('status');
+  fsync.status = function (cb) {
+    queueRequest('status', cb);
   };
 
-  fsync.system = function () {
-    return queueRequest('system');
+  fsync.system = function (cb) {
+    queueRequest('system', cb);
   };
 
-  fsync.ls = function (path) {
-    return queueRequest('list', path || '/');
+  fsync.ls = function (path, cb) {
+    if (arguments.length === 1) {
+      cb = path;
+      path = '/';
+    }
+    queueRequest('list', path || '/', cb);
   };
 
   fsync.push = function () {};
 
-  fsync.pull = function (src, dest) {
-    var ee = new events.EventEmitter();
-
-    src = src || settings.remoteDir;
-    dest = path.resolve(dest || settings.localDir);
+  fsync.pull = function () {
+    var args = Array.prototype.slice.call(arguments, 0);
+    var cb = args.pop();
+    var src = args.shift() || settings.remoteDir;
+    var dest = path.resolve(args.shift() || settings.localDir);
 
     mkdirp.sync(dest);
 
-    fsync.ls(src).on('error', function (err) {
-      ee.emit('error', err);
-    }).on('data', function (list) {
-      async.each(list, function (obj, cb) {
-        console.log(obj);
-        var nameParts = obj.name.split('/');
-        var fname = nameParts.pop();
-        var dir = path.join(dest, nameParts.join('/'));
-        var absPath = path.join(dir, fname);
+    function download(obj, cb) {
+      console.log(obj.name);
+      var nameParts = obj.name.split('/');
+      var fname = nameParts.pop();
+      var dir = path.join(dest, nameParts.join('/'));
+      var absPath = path.join(dir, fname);
 
-        mkdirp.sync(dir);
+      mkdirp.sync(dir);
 
-        console.log(dir, fname, absPath);
-
-        if (obj.type === 'd') {
-          mkdirp(absPath, cb);
-        } else if (obj.type === '-') {
-          queueRequest('get', obj.name)
+      if (obj.type === 'd') {
+        mkdirp(absPath, cb);
+      } else if (obj.type === '-') {
+        queueRequest('get', obj.name, function (err, stream) {
+          if (err) { return cb(err); }
+          stream
+            .pipe(fs.createWriteStream(absPath))
             .on('error', cb)
-            .on('data', function (stream) {
-              stream
-                .pipe(fs.createWriteStream(absPath))
-                .on('error', cb)
-                .on('finish', function () {
-                  console.log('finish', arguments);
-                });
-            });
-        } else if (obj.type === 'l') {
-          console.log('HANDLE SYMLINKS!!!');
-        }
-      }, function (err) {
-        console.log('ERROR', err);
-      });
-    });
+            .on('finish', cb);
+        });
+      } else if (obj.type === 'l') {
+        console.log('HANDLE SYMLINKS!!!');
+      }
+    }
 
-    return ee;
+    fsync.ls(src, function (err, list) {
+      if (err) { return cb(err); }
+      async.each(list, download, cb);
+    });
   };
 
   return fsync;

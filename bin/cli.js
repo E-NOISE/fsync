@@ -45,17 +45,11 @@ if (typeof fn !== 'function') {
   return error(new Error('Unknown command'));
 }
 
-var ee = fn.apply(client, argv._);
-
-ee.on('error', error);
-
-ee.on('data', function (data) {
+fn.apply(client, argv._.concat(function (err, data) {
+  if (err) { return error(err); }
   console.log(data);
-});
-
-ee.on('end', function () {
   process.exit(0);
-});
+}));
 
 
 function error(err) {
