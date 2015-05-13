@@ -38,7 +38,7 @@ module.exports = function (options) {
 
   function getClient(cb) {
     var client = clients.filter(function (client) {
-      return client._ready;
+      return client._available;
     }).shift();
 
     if (client) {
@@ -81,9 +81,13 @@ module.exports = function (options) {
 
     getClient(function (err, client) {
       if (err) { return cb(err); }
+      client._available = false;
       var fn = client[command];
       log.debug('Sending request...', { command: command, args: args });
-      fn.apply(client, args.concat(cb));
+      fn.apply(client, args.concat(function (err, data) {
+        client._available = true;
+        cb(err, data);
+      }));
     });
   }, settings.maxConcurrency);
 
@@ -91,7 +95,7 @@ module.exports = function (options) {
     log.debug('No requests left in queue');
     clients.forEach(function (client) {
       if (!client._curReq) {
-        client.end();
+        //client.end();
       }
     });
   };
@@ -146,7 +150,7 @@ module.exports = function (options) {
     mkdirp.sync(dest);
 
     function download(obj, cb) {
-      console.log(obj.name);
+      //console.log(obj.name);
       var nameParts = obj.name.split('/');
       var fname = nameParts.pop();
       var dir = path.join(dest, nameParts.join('/'));
@@ -155,7 +159,7 @@ module.exports = function (options) {
       mkdirp.sync(dir);
 
       if (obj.type === 'd') {
-        mkdirp(absPath, cb);
+        fsync.pull(obj.name, dir, cb);
       } else if (obj.type === '-') {
         queueRequest('get', obj.name, function (err, stream) {
           if (err) { return cb(err); }
@@ -169,8 +173,11 @@ module.exports = function (options) {
       }
     }
 
-    fsync.ls(src, function (err, list) {
+    fsync.ls(src, function (err, data) {
       if (err) { return cb(err); }
+      var list = data.filter(function (obj) {
+        return [ '.', '..' ].indexOf(obj.name) === -1;
+      });
       async.each(list, download, cb);
     });
   };
