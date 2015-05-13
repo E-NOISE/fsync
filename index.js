@@ -20,7 +20,7 @@ var defaults = {
   pasvTimeout: 10000,
   keepalive: 10000,
   localDir: process.cwd(),
-  remoteDir: null,
+  remoteDir: '',
   maxConcurrency: 3
 };
 
@@ -136,7 +136,12 @@ module.exports = function (options) {
       cb = path;
       path = '/';
     }
-    queueRequest('list', path || '/', cb);
+    queueRequest('list', path || '/', function (err, data) {
+      if (err) { return cb(err); }
+      cb(null, data.filter(function (obj) {
+        return [ '.', '..' ].indexOf(obj.name) === -1;
+      }));
+    });
   };
 
   fsync.push = function () {};
@@ -150,18 +155,13 @@ module.exports = function (options) {
     mkdirp.sync(dest);
 
     function download(obj, cb) {
-      //console.log(obj.name);
-      var nameParts = obj.name.split('/');
-      var fname = nameParts.pop();
-      var dir = path.join(dest, nameParts.join('/'));
-      var absPath = path.join(dir, fname);
-
-      mkdirp.sync(dir);
+      var fname = src + '/' + obj.name;
+      var absPath = path.join(dest, obj.name);
 
       if (obj.type === 'd') {
-        fsync.pull(obj.name, dir, cb);
+        fsync.pull(fname, absPath, cb);
       } else if (obj.type === '-') {
-        queueRequest('get', obj.name, function (err, stream) {
+        queueRequest('get', fname, function (err, stream) {
           if (err) { return cb(err); }
           stream
             .pipe(fs.createWriteStream(absPath))
@@ -170,14 +170,12 @@ module.exports = function (options) {
         });
       } else if (obj.type === 'l') {
         console.log('HANDLE SYMLINKS!!!');
+        cb();
       }
     }
 
-    fsync.ls(src, function (err, data) {
+    fsync.ls(src, function (err, list) {
       if (err) { return cb(err); }
-      var list = data.filter(function (obj) {
-        return [ '.', '..' ].indexOf(obj.name) === -1;
-      });
       async.each(list, download, cb);
     });
   };
