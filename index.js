@@ -30,28 +30,25 @@ module.exports = function (options) {
     return memo;
   }, {});
 
-  var q = async.queue(function (task, cb) {
-    var ee = task.ee;
-    var client = new Ftp();
-    var resp;
+  var clients = [];
+
+  function getClient(ee, cb) {
+    var client = clients.filter(function (client) {
+      return client._ready;
+    }).shift();
+
+    if (client) {
+      ee.emit('data', 'Reusing client...');
+      return cb(null, client);
+    }
+
+    ee.emit('data', 'instantiating new client...');
+    clients[clients.length] = client = new Ftp();
 
     client.on('error', cb);
 
     client.on('greeting', function (msg) {
       ee.emit('data', 'greeting: ' + msg);
-    });
-
-    client.on('ready', function () {
-      client[task.command].apply(client, task.args.concat(function (err, data) {
-        if (data instanceof stream.Readable) {
-          data.on('close', function () {
-            console.log('CLOSE', arguments);
-          });
-        } else {
-          resp = data;
-          client.end();
-        }
-      }));
     });
 
     client.on('close', function (hadError) {
@@ -60,12 +57,46 @@ module.exports = function (options) {
 
     client.on('end', function () {
       console.log('end');
-      cb(null, resp);
+    });
+
+    client.on('ready', function () {
+      cb(null, client);
     });
 
     client.connect(settings);
+  }
+
+  var q = async.queue(function (task, cb) {
+    var ee = task.ee;
+    var command = task.command;
+    var args = task.args;
+
+    getClient(ee, function (err, client) {
+      var resp;
+      var fn = client[task.command];
+    
+      fn.apply(client, args.concat(function (err, data) {
+        if (err) { return cb(err); }
+
+        if (data instanceof stream.Readable) {
+          data.on('close', function () {
+            console.log('CLOSE', arguments);
+          });
+        } else {
+          ee.emit('data', data);
+          cb();
+        }
+      }));
+    });
+
   }, settings.maxConcurrency);
 
+  q.drain = function () {
+    console.log('drain');
+    clients.forEach(function (client) {
+      client.end();
+    });
+  };
 
   function queueRequest() {
     var ee = new events.EventEmitter();
@@ -78,9 +109,6 @@ module.exports = function (options) {
         command: command,
         args: args,
         ee: ee
-      }, function (err, data) {
-        if (err) { return ee.emit('error', err); }
-        //ee.emit('data', data);
       });
     });
 
