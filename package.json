@@ -1,6 +1,8 @@
 {
   "name": "fsync",
   "version": "0.0.0",
+  "repository": "E-NOISE/fsync",
+  "license": "MIT",
   "author": {
     "name": "ENOISE",
     "email": "hi@enoi.se",
@@ -10,11 +12,12 @@
     "fsync": "./bin/cli.js"
   },
   "dependencies": {
-    "async": "^0.9.0",
-    "bunyan": "^1.3.5",
+    "async": "^1.2.1",
+    "clive": "lupomontero/clive",
     "ftp": "^0.3.10",
-    "minimist": "^1.1.1",
-    "mkdirp": "^0.5.0"
+    "lodash": "^3.9.3",
+    "mkdirp": "^0.5.1",
+    "text-table": "^0.2.0"
   },
   "devDependencies": {
     "gulp": "^3.8.11",

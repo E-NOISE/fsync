@@ -1,12 +1,9 @@
 var fs = require('fs');
 var path = require('path');
-var events = require('events');
-var stream = require('stream');
 var async = require('async');
 var mkdirp = require('mkdirp');
-var bunyan = require('bunyan');
 var Ftp = require('ftp');
-var pkg = require('./package.json');
+var _ = require('lodash');
 
 
 var defaults = {
@@ -25,16 +22,37 @@ var defaults = {
 };
 
 
-module.exports = function (options) {
+function removeLeadingSlash(str) {
+  return (str.charAt(0) === '/') ? str.slice(1) : str;
+}
 
-  var settings = Object.keys(defaults).reduce(function (memo, key) {
-    memo[key] = options.hasOwnProperty(key) ? options[key] : defaults[key];
-    return memo;
-  }, {});
+function removeTrailingSlash(str) {
+  return (str.charAt(str.length - 1) === '/') ? str.slice(0, -1) : str;
+}
 
-  var log = bunyan.createLogger({ name: pkg.name, level: 'debug' });
 
+module.exports = function Fsync(options) {
+
+  var settings = _.extend({}, defaults, options);
   var clients = [];
+
+  function queue(cmd, args, cb) {
+    getClient(function (err, client) {
+      if (err) { return cb(err); }
+      client._available = false;
+      client[cmd].apply(client, args.concat(function (err, data) {
+        client._available = true;
+        cb(err, data);
+      }));
+    });
+  }
+
+  function removeClient(id) {
+    var client = clients[id];
+    if (!client) { return; }
+    clients.splice(id, 1);
+    client.destroy();
+  }
 
   function getClient(cb) {
     var client = clients.filter(function (client) {
@@ -42,145 +60,95 @@ module.exports = function (options) {
     }).shift();
 
     if (client) {
-      client.log.info('Reusing client...');
       return cb(null, client);
+    } else if (clients.length >= settings.maxConcurrency) {
+      return setTimeout(function () { getClient(cb); }, 10);
     }
 
-    var clientId = clients.length;
-    clients[clientId] = client = new Ftp();
+    var id = clients.length;
+    var prefix = 'client-' + id;
 
-    client.log = log.child({ client: clientId });
-    client.log.debug('Instantiating new client...');
+    clients[id] = client = new Ftp();
 
-    client.on('error', cb);
+    client.on('error', function (err) {
+      err.client = id;
+      cb(err);
+      cb = function () {};
+      removeClient(id);
+    });
 
     client.on('greeting', function (msg) {
-      client.log.debug('Greeting: ' + msg);
+      //console.log(prefix + ': Greeting: ' + msg);
     });
 
     client.on('ready', function () {
-      client.log.debug('Client is ready');
       cb(null, client);
     });
 
     client.on('end', function () {
-      client.log.debug('Client ended');
-    });
-
-    client.on('close', function (hadError) {
-      client.log.debug('Client has closed', hadError);
+      removeClient(id);
     });
 
     client.connect(settings);
   }
 
-  var q = async.queue(function (task, cb) {
-    var log = task.log;
-    var command = task.command;
-    var args = task.args;
 
-    getClient(function (err, client) {
-      if (err) { return cb(err); }
-      client._available = false;
-      var fn = client[command];
-      log.debug('Sending request...', { command: command, args: args });
-      fn.apply(client, args.concat(function (err, data) {
-        client._available = true;
-        cb(err, data);
-      }));
-    });
-  }, settings.maxConcurrency);
+  return {
 
-  q.drain = function () {
-    log.debug('No requests left in queue');
-    clients.forEach(function (client) {
-      if (!client._curReq) {
-        //client.end();
-      }
-    });
-  };
+    queue: queue,
 
-  var requests = 0;
+    ls: function (path, cb) {
+      queue('list', [ path || '' ], function (err, data) {
+        if (err) { return cb(err); }
+        cb(null, data.filter(function (obj) {
+          return [ '.', '..' ].indexOf(obj.name) === -1;
+        }));
+      });
+    },
 
-  function queueRequest() {
-    var args = Array.prototype.slice.call(arguments, 0)
-    var cb = args.pop();
-    var command = args.shift();
-    var reqId = requests++;
-    var childLog = log.child({ request: reqId });
+    pull: function (remote, local, cb) {
+      var fsync = this;
+      var src = removeTrailingSlash(settings.remoteDir) + '/' + removeLeadingSlash(remote);
+      var dest = path.resolve(local || settings.localDir);
 
-    process.nextTick(function () {
-      childLog.debug('Queuing command...', { command: command, args: args });
-      q.push({
-        command: command,
-        args: args,
-        log: childLog
-      }, cb);
-    });
-  }
+      doPull(src, dest, cb);
 
-
-  var fsync = {};
-
-
-  fsync.status = function (cb) {
-    queueRequest('status', cb);
-  };
-
-  fsync.system = function (cb) {
-    queueRequest('system', cb);
-  };
-
-  fsync.ls = function (path, cb) {
-    if (arguments.length === 1) {
-      cb = path;
-      path = '/';
-    }
-    queueRequest('list', path || '/', function (err, data) {
-      if (err) { return cb(err); }
-      cb(null, data.filter(function (obj) {
-        return [ '.', '..' ].indexOf(obj.name) === -1;
-      }));
-    });
-  };
-
-  fsync.push = function () {};
-
-  fsync.pull = function () {
-    var args = Array.prototype.slice.call(arguments, 0);
-    var cb = args.pop();
-    var src = args.shift() || settings.remoteDir;
-    var dest = path.resolve(args.shift() || settings.localDir);
-
-    mkdirp.sync(dest);
-
-    function download(obj, cb) {
-      var fname = src + '/' + obj.name;
-      var absPath = path.join(dest, obj.name);
-
-      if (obj.type === 'd') {
-        fsync.pull(fname, absPath, cb);
-      } else if (obj.type === '-') {
-        queueRequest('get', fname, function (err, stream) {
+      function doPull(src, dest, cb) {
+        mkdirp.sync(dest);
+        fsync.ls(src, function (err, list) {
           if (err) { return cb(err); }
-          stream
-            .pipe(fs.createWriteStream(absPath))
-            .on('error', cb)
-            .on('finish', cb);
+          async.each(list, download.bind(null, src, dest), cb);
         });
-      } else if (obj.type === 'l') {
-        console.log('HANDLE SYMLINKS!!!');
-        cb();
+      }
+
+      function download(src, dest, obj, cb) {
+        var fname = removeLeadingSlash(removeTrailingSlash(src) + '/' + obj.name);
+        var absPath = path.join(dest, obj.name);
+
+        if (src === obj.name) {
+          fname = obj.name;
+        }
+
+        if (obj.type === 'd') {
+          doPull(fname, absPath, cb);
+        } else if (obj.type === '-') {
+          console.log(fname, absPath);
+          queue('get', [ fname ], function (err, stream) {
+            if (err) { return cb(err); }
+            stream
+              .pipe(fs.createWriteStream(absPath))
+              .on('error', cb)
+              .on('finish', cb);
+          });
+        } else if (obj.type === 'l') {
+          console.log('HANDLE SYMLINKS!!!');
+          cb();
+        }
       }
     }
 
-    fsync.ls(src, function (err, list) {
-      if (err) { return cb(err); }
-      async.each(list, download, cb);
-    });
   };
-
-  return fsync;
 
 };
+
 
