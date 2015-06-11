@@ -4,6 +4,7 @@ var async = require('async');
 var mkdirp = require('mkdirp');
 var Ftp = require('ftp');
 var _ = require('lodash');
+var prettyBytes = require('pretty-bytes');
 
 
 var defaults = {
@@ -28,6 +29,15 @@ function removeLeadingSlash(str) {
 
 function removeTrailingSlash(str) {
   return (str.charAt(str.length - 1) === '/') ? str.slice(0, -1) : str;
+}
+
+// compare modified time and size
+function hasChanged(obj, absPath) {
+  if (!fs.existsSync(absPath)) { return true; }
+  var stat = fs.statSync(absPath);
+  if (obj.size !== stat.size) { return true; }
+  if (obj.date > stat.mtime) { return true; }
+  return false;
 }
 
 
@@ -132,13 +142,27 @@ module.exports = function Fsync(options) {
         if (obj.type === 'd') {
           doPull(fname, absPath, cb);
         } else if (obj.type === '-') {
-          console.log(fname, absPath);
+          if (!hasChanged(obj, absPath)) {
+            console.log(('Skip file (no change): ' + fname).grey);
+            return cb();
+          }
+          console.log(('Queuing download: ' + fname + ' ' + prettyBytes(obj.size)).cyan);
           queue('get', [ fname ], function (err, stream) {
-            if (err) { return cb(err); }
+            if (err) {
+              console.error(('Error downloading: ' + fname + ' ' + err.message).red);
+              return cb();
+            }
             stream
               .pipe(fs.createWriteStream(absPath))
-              .on('error', cb)
-              .on('finish', cb);
+              .on('error', function (err) {
+                console.error(('Error writing file: ' + absPath + ' ' + err.message).red);
+                cb();
+              })
+              .on('finish', function () {
+                fs.utimesSync(absPath, new Date(), obj.date);
+                console.log(('File downloaded: ' + fname + ' ' + prettyBytes(obj.size)).green);
+                cb();
+              });
           });
         } else if (obj.type === 'l') {
           console.log('HANDLE SYMLINKS!!!');

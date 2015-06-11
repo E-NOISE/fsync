@@ -17,6 +17,7 @@
     "ftp": "^0.3.10",
     "lodash": "^3.9.3",
     "mkdirp": "^0.5.1",
+    "pretty-bytes": "^2.0.1",
     "text-table": "^0.2.0"
   },
   "devDependencies": {
